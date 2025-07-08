@@ -249,21 +249,27 @@ def initialize_session_state():
         }
         st.session_state.current_thread_id = default_thread_id
 
+    st.session_state.chat_memory = st.session_state.conversation_threads[st.session_state.current_thread_id]
+
 def create_new_thread():
     new_thread_id = f"thread_{len(st.session_state.conversation_threads) + 1}_{datetime.now().strftime('%H%M%S')}"
     new_thread_name = f"New Conversation {len(st.session_state.conversation_threads) + 1}"
-    
+
     st.session_state.conversation_threads[new_thread_id] = ChatMemory()
     st.session_state.thread_metadata[new_thread_id] = {
         'name': new_thread_name,
         'created_at': datetime.now()
     }
     st.session_state.current_thread_id = new_thread_id
-    st.rerun() # Rerun to update the UI with the new thread
+    st.session_state.chat_memory = st.session_state.conversation_threads[new_thread_id]
+    st.session_state.thread_created = True  # Set a flag to trigger rerun at the top of main()
+
 
 def switch_thread(thread_id_to_switch_to):
     st.session_state.current_thread_id = thread_id_to_switch_to
-    st.rerun() # Rerun to update the UI with the selected thread's history
+    st.session_state.chat_memory = st.session_state.conversation_threads[thread_id_to_switch_to]
+    st.session_state.thread_switched = True  # Set a flag to trigger rerun at the top of main()
+
 
 def display_model_info():
     """Display current model information"""
@@ -424,9 +430,9 @@ def display_welcome_message():
 
 def display_chat_interface():
     """Display the main chat interface with improved conversation history handling"""
-    # Get chat history from memory
+    # Get chat history from memory (this now correctly refers to the active thread's memory)
     chat_history = st.session_state.chat_memory.get_chat_history()
-    
+
     # Display conversation history
     for i, message in enumerate(chat_history):
         if message['role'] == 'user':
@@ -443,9 +449,10 @@ def display_chat_interface():
                 {f'<div class="source-info">📚 Sources: {", ".join(message.get("sources", []))}</div>' if message.get('sources') else ''}
             </div>
             """, unsafe_allow_html=True)
-            
+
             # Show evaluation metrics only for the most recent assistant response
-            if (st.session_state.show_evaluation and st.session_state.last_evaluation and 
+            if (st.session_state.show_evaluation and
+                st.session_state.get('last_evaluation') and # Use .get() for safety
                 i == len(chat_history) - 1 and message['role'] == 'assistant'):
                 st.markdown('<div class="evaluation-panel">', unsafe_allow_html=True)
                 TriadMetricsDisplay.display_metrics(
@@ -457,79 +464,81 @@ def display_chat_interface():
     # Chat input
     if not st.session_state.processing_question:
         user_input = st.chat_input("Ask me anything about your financial documents...")
-        
+
         if user_input:
             process_user_question(user_input)
+
 
 def process_user_question(user_input: str):
     """Process user question and generate response"""
     st.session_state.processing_question = True
-    
+
     try:
+        # st.session_state.chat_memory is already pointing to the current thread's memory
         st.session_state.chat_memory.add_message('user', user_input)
-        
+
         with st.spinner("🔍 Searching relevant information with HNSW..."):
             if st.session_state.search_mode == 'hybrid':
                 relevant_docs = st.session_state.vector_store.get_relevant_documents(
-                    user_input, 
+                    user_input,
                     k=getattr(st.session_state, 'k_docs', 5),
                     use_hybrid=True
                 )
             else:
                 relevant_docs = st.session_state.vector_store.get_relevant_documents(
-                    user_input, 
+                    user_input,
                     k=getattr(st.session_state, 'k_docs', 5),
                     use_hybrid=False
                 )
-        
+
         if relevant_docs:
             context = "\n\n".join([doc.page_content for doc in relevant_docs])
             conversation_context = st.session_state.chat_memory.get_conversation_context()
-            
+
             with st.spinner("🤔 Generating response..."):
                 response = st.session_state.llm_manager.generate_response(
                     query=user_input,
                     context=context,
                     conversation_history=conversation_context
                 )
-            
+
             sources = list(set([doc.metadata.get('source', 'Unknown') for doc in relevant_docs]))
-            
+
             # ⭐ FIXED EVALUATION CALL
             if st.session_state.show_evaluation:
                 with st.spinner("📊 Evaluating response quality..."):
                     try:
                         # Extract just the text content from documents
                         retrieved_doc_contents = [doc.page_content for doc in relevant_docs]
-                        
+
                         # ⭐ KEY FIX: Pass parameters correctly
                         evaluation = st.session_state.evaluation_metrics.evaluate_response(
-                            answer=response,          # Changed from 'response' to 'answer'
+                            answer=response,       # Changed from 'response' to 'answer'
                             query=user_input,
                             context=context,
                             retrieved_docs=retrieved_doc_contents,
                             reference=context  # ⭐ Use context as reference for better relevance
                         )
-                        
+
                         st.session_state.last_evaluation = evaluation
-                        
+
                     except Exception as e:
                         st.error(f"⚠️ Evaluation failed: {str(e)}")
                         st.session_state.last_evaluation = None
-            
+
             st.session_state.chat_memory.add_message('assistant', response, sources)
-            
+
         else:
             response = "I couldn't find relevant information in your documents to answer your question."
             st.session_state.chat_memory.add_message('assistant', response)
             st.session_state.last_evaluation = None
-    
+
     except Exception as e:
         st.error(f"❌ Error processing question: {str(e)}")
         response = "I apologize, but I encountered an error while processing your question."
         st.session_state.chat_memory.add_message('assistant', response)
         st.session_state.last_evaluation = None
-    
+
     finally:
         st.session_state.processing_question = False
         st.rerun()
@@ -538,7 +547,7 @@ def display_suggested_questions():
     """Display suggested questions for users"""
     if st.session_state.documents_loaded:
         st.markdown("### 💡 Try asking:")
-        
+
         questions = [
             "What are the key financial metrics for this period?",
             "Show me the revenue trends and growth rates",
@@ -547,53 +556,14 @@ def display_suggested_questions():
             "What are the main business segments and their performance?",
             "What capital expenditures were made this quarter?"
         ]
-        
+
         cols = st.columns(2)
         for i, question in enumerate(questions):
             with cols[i % 2]:
                 if st.button(question, key=f"suggested_{i}"):
                     st.session_state.suggested_question = question
                     st.rerun()
-        
-        # Handle suggested question
-        if hasattr(st.session_state, 'suggested_question'):
-            user_input = st.session_state.suggested_question
-            delattr(st.session_state, 'suggested_question')
-            
-            # Process the suggested question
-            
-            st.session_state.chat_memory.add_message('user', user_input)
-            
-            relevant_docs = st.session_state.vector_store.get_relevant_documents(user_input, k=5)
-            
-            if relevant_docs:
-                context = "\n\n".join([doc.page_content for doc in relevant_docs])
-                conversation_context = st.session_state.chat_memory.get_conversation_context()
-                
-                response = st.session_state.llm_manager.generate_response(
-                    query=user_input,
-                    context=context,
-                    conversation_history=conversation_context
-                )
-                
-                sources = list(set([doc.metadata.get('source', 'Unknown') for doc in relevant_docs]))
-                
-                # Evaluate response if enabled
-                if st.session_state.show_evaluation:
-                    evaluation = st.session_state.evaluation_metrics.evaluate_response(
-                        answer=response,
-                        query=user_input,
-                        context=context
-                    )
-                    st.session_state.last_evaluation = evaluation
-                
-                st.session_state.chat_memory.add_message('assistant', response, sources)
-            else:
-                response = "I couldn't find relevant information to answer this question."
-                st.session_state.chat_memory.add_message('assistant', response)
-                st.session_state.last_evaluation = None
-            
-            st.rerun()
+
 def download_chat_history_for_thread(chat_memory_instance: ChatMemory):
     chat_history = chat_memory_instance.get_chat_history()
     if not chat_history:
@@ -623,6 +593,53 @@ def download_chat_history_for_thread(chat_memory_instance: ChatMemory):
 def main():
     """Main application function"""
     initialize_session_state()
+
+    # Handle rerun flags for thread switching and creation
+    if st.session_state.get('thread_switched', False):
+        st.session_state.thread_switched = False
+        st.rerun()
+    if st.session_state.get('thread_created', False):
+        st.session_state.thread_created = False
+        st.rerun()
+
+    # Handle suggested question at the top level (prevents double rendering)
+    if hasattr(st.session_state, 'suggested_question'):
+        user_input = st.session_state.suggested_question
+        delattr(st.session_state, 'suggested_question')
+        st.session_state.processing_question = True
+        try:
+            st.session_state.chat_memory.add_message('user', user_input)
+            relevant_docs = st.session_state.vector_store.get_relevant_documents(user_input, k=5)
+            if relevant_docs:
+                context = "\n\n".join([doc.page_content for doc in relevant_docs])
+                conversation_context = st.session_state.chat_memory.get_conversation_context()
+                response = st.session_state.llm_manager.generate_response(
+                    query=user_input,
+                    context=context,
+                    conversation_history=conversation_context
+                )
+                sources = list(set([doc.metadata.get('source', 'Unknown') for doc in relevant_docs]))
+                if st.session_state.show_evaluation:
+                    evaluation = st.session_state.evaluation_metrics.evaluate_response(
+                        answer=response,
+                        query=user_input,
+                        context=context,
+                        retrieved_docs=[doc.page_content for doc in relevant_docs],
+                        reference=context
+                    )
+                    st.session_state.last_evaluation = evaluation
+                st.session_state.chat_memory.add_message('assistant', response, sources)
+            else:
+                response = "I couldn't find relevant information to answer this question."
+                st.session_state.chat_memory.add_message('assistant', response)
+                st.session_state.last_evaluation = None
+        except Exception as e:
+            st.error(f"❌ Error processing suggested question: {str(e)}")
+            st.session_state.chat_memory.add_message('assistant', "I apologize, but I encountered an error while processing your suggested question.")
+            st.session_state.last_evaluation = None
+        finally:
+            st.session_state.processing_question = False
+            st.rerun()
     
     # Header
     st.markdown(f'''
@@ -780,30 +797,30 @@ def main():
         # Get current display name for the selected thread
         current_thread_name = st.session_state.thread_metadata[st.session_state.current_thread_id]['name']
 
-        selected_thread_name = st.selectbox(
+        def _on_thread_select():
+            selected_name = st.session_state['thread_select_box']
+            if selected_name in all_thread_options:
+                st.session_state.current_thread_id = all_thread_options[selected_name]
+                st.session_state.thread_switched = True
+
+        # Use session state key and on_change callback for immediate sync
+        st.selectbox(
             "Or select another conversation:",
             options=list(all_thread_options.keys()),
             index=list(all_thread_options.keys()).index(current_thread_name) if current_thread_name in all_thread_options else 0,
-            key="thread_select_box",
-            on_change=lambda: switch_thread(all_thread_options[st.session_state.selected_thread_box]) # Update current_thread_id
+            key='thread_select_box',
+            on_change=_on_thread_select
         )
-        # Ensure the session_state.current_thread_id is aligned if selectbox changes it
-        st.session_state.current_thread_id = all_thread_options[selected_thread_name]
 
 
         st.button("➕ New Conversation", on_click=create_new_thread, use_container_width=True)
         st.markdown("---")
 
         st.subheader("Chat Options")
-        # Download history button for the currently active thread
         current_chat_memory = st.session_state.conversation_threads[st.session_state.current_thread_id]
+        st.markdown("---")
+        # Always show the download button, which triggers download directly
         download_chat_history_for_thread(current_chat_memory)
-
-        # You might also want a clear current thread history button
-        if st.button("Clear Current Thread History", help="Clears all messages in the active conversation thread."):
-            current_chat_memory.clear_history()
-            st.success("Current thread history cleared!")
-            st.rerun()
         
         # Display current model info
         display_model_info()
